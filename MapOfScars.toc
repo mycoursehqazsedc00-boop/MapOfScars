@@ -1,0 +1,7 @@
+## Interface: 11200
+## Title: MapOfScars
+## Author: Lanrutcon, backported by moh; ClassicAPI/UnitXP3/SuperWoW integration
+## Notes: SkyCompass. Optional: ClassicAPI, UnitXP_SP3, SuperWoW (auto-detected, addon works without them). /mosstatus to check.
+## Version: 1.3
+
+MapOfScars.lua
