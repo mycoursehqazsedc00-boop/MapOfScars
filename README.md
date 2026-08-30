@@ -26,7 +26,8 @@ Run `/mosstatus` in-game any time to confirm what's actually detected and loaded
 
 ## Screenshot
 
-![MapOfScars compass in-game](screenshots/compass-ingame.png)
+<img width="883" height="216" alt="image" src="https://github.com/user-attachments/assets/a3f68a4c-67f3-436d-bc54-b7364ae26b22" />
+
 
 The compass bar sits centered at the top of the screen. Cardinal letters (`N`/`S`/`E`/`W`)
 slide left/right along the bar as you turn, and POI icons (quest markers, pings, tracked
