@@ -8,16 +8,36 @@
 	works exactly like stock MapOfScars with none of them installed.
 
 	  - ClassicAPI  https://github.com/brues-code/ClassicAPI
-	                Backports a native GetPlayerFacing(). When present we use
-	                it directly and skip the old "hidden minimap + 0-scale
-	                player-arrow model" hack entirely.
+	                Does the heavy lifting here, and turns out to cover
+	                everything the unit-tracking feature needs on its own:
+	                  * GetPlayerFacing() - native facing, replaces the old
+	                    "hidden minimap + 0-scale player-arrow model" hack.
+	                  * C_Map.GetPlayerMapPosition(uiMapID, unit) - map-percent
+	                    position for ANY visible/synced unit (target, mouseover,
+	                    nameplates, party/raid), not just "player". Far more
+	                    reliable than hoping the stock GetPlayerMapPosition
+	                    accepts a non-player token.
+	                  * UnitDistanceSquared(unit) - real yard distance,
+	                    self-contained (no sibling DLL needed).
+	                  * UnitInLineOfSight(unit) - real terrain+WMO line of
+	                    sight, self-contained, and documented to route
+	                    through UnitXP_SP3's own hook when that's ALSO
+	                    loaded, so the two never fight over the same check.
+	                  * C_Timer.NewTicker - used to throttle the POI
+	                    distance/LoS refresh to 5/sec instead of every frame.
+	                We deliberately never call the bare global UnitPosition()
+	                here: ClassicAPI and SuperWoW both register a function
+	                under that exact name with different return shapes, and
+	                whichever loads last silently wins - a real, documented
+	                footgun. Everything above sidesteps it entirely.
 
 	  - UnitXP_SP3  https://codeberg.org/konaka/UnitXP_SP3
-	                Adds UnitXP("distanceBetween", u1, u2) and
-	                UnitXP("inSight", "camera", unit). Used for an optional
-	                unit-tracked POI mode with accurate distance + line of
-	                sight hiding (addPOIForUnit), on top of the original
-	                raw x/y ping-point POIs.
+	                UnitXP("distanceBetween", ...) / UnitXP("inSight", ...).
+	                Kept only as the FALLBACK for distance/LoS when
+	                ClassicAPI isn't installed - with ClassicAPI present,
+	                its own UnitDistanceSquared/UnitInLineOfSight are used
+	                instead (see above), so UnitXP_SP3 is no longer
+	                required for this addon's features, just still supported.
 
 	  - SuperWoW    https://github.com/balakethelock/SuperWoW
 	                UnitExists(unit) returns a GUID as its 2nd value when
@@ -26,10 +46,14 @@
 
 	  - nampower    https://github.com/brues-code/nampower
 	  - VanillaHelpers https://github.com/isfir/VanillaHelpers
-	                Neither exposes anything a compass addon can use
-	                (nampower = spell-cast queueing, VanillaHelpers =
-	                texture/model swapping + file IO), so they're only
-	                reported by /mosstatus for debugging, not used.
+	  - WeirdUtils  https://codeberg.org/MarcelineVQ/WeirdUtils
+	                None of the three expose anything a compass addon can
+	                use: nampower is spell-cast queueing, VanillaHelpers is
+	                texture/model swapping + file IO, and WeirdUtils' only
+	                position-related feature (WorldMarker) is gated to raid
+	                leader/assist and returns nil otherwise - not usable as
+	                a general "where is this unit" query. All three are only
+	                reported by /mosstatus for debugging, never used.
 ]]
 
 local Addon = CreateFrame('Frame')
@@ -73,7 +97,22 @@ local NativeGetPlayerFacing = GetPlayerFacing
 
 local HAS_CLASSICAPI = type(NativeGetPlayerFacing) == 'function'
 
--- UnitXP_SP3's own documented existence check.
+-- ClassicAPI's C_Map namespace. GetPlayerMapPosition here works for any
+-- visible/synced unit, not just "player" - see header comment.
+local HAS_CMAP = (type(C_Map) == 'table'
+	and type(C_Map.GetPlayerMapPosition) == 'function'
+	and type(C_Map.GetBestMapForUnit) == 'function')
+
+-- Self-contained ClassicAPI distance/LoS backports. Neither needs
+-- UnitXP_SP3, and UnitInLineOfSight is documented to cooperate with it
+-- (routes through UnitXP_SP3's own hook) rather than conflict.
+local HAS_UNITDISTSQ = (type(UnitDistanceSquared) == 'function')
+local HAS_LOS = (type(UnitInLineOfSight) == 'function')
+
+local HAS_CTIMER = (type(C_Timer) == 'table' and type(C_Timer.NewTicker) == 'function')
+
+-- UnitXP_SP3's own documented existence check. Kept as fallback for
+-- distance/LoS when the ClassicAPI equivalents above aren't available.
 local HAS_UNITXP3 = (type(UnitXP) == 'function') and pcall(UnitXP, 'nop', 'nop')
 
 local HAS_SUPERWOW = (SUPERWOW_VERSION ~= nil)
@@ -82,6 +121,8 @@ local HAS_SUPERWOW = (SUPERWOW_VERSION ~= nil)
 -- surfaced through /mosstatus so you can confirm what's actually loaded.
 local HAS_NAMPOWER = (type(nampower) == 'table') or (type(NAMPOWER_VERSION) ~= 'nil')
 local HAS_VANILLAHELPERS = (type(ReadFile) == 'function' and type(SetUnitBlip) == 'function')
+-- WeirdUtils ships its own clean version-query API, so no guessing needed.
+local HAS_WEIRDUTILS = (type(GetWeirdUtilsVersion) == 'function')
 
 ---------------------------------------------
 -- Useful functions
@@ -150,6 +191,67 @@ end
 --used to measure angles for raw x/y POI points (minimap pings, etc)
 local function getDistanceTo(x, y)
 	return sqrt((x-playerX)^2+(y-playerY)^2)
+end
+
+-- Map-percent position of ANY unit, not just "player". Prefers ClassicAPI's
+-- C_Map.GetPlayerMapPosition (documented to work for any visible/synced
+-- unit token). Without ClassicAPI, best-effort fallback on the stock
+-- global, which is only reliably documented for "player" - it may just
+-- return nothing for other tokens on plain 1.12.
+local function getUnitMapPosition(unit)
+	if HAS_CMAP then
+		local uiMapID = C_Map.GetBestMapForUnit('player')
+		if uiMapID then
+			local pos = C_Map.GetPlayerMapPosition(uiMapID, unit)
+			if pos then
+				local ux, uy = pos:GetXY()
+				if ux and uy then
+					return round(ux*100, 3), round(uy*100, 3)
+				end
+			end
+		end
+		return nil
+	end
+
+	local ok, ux, uy = pcall(GetPlayerMapPosition, unit)
+	if ok and ux and uy and (ux ~= 0 or uy ~= 0) then
+		return round(ux*100, 3), round(uy*100, 3)
+	end
+	return nil
+end
+
+-- Distance (yards) + line-of-sight for a tracked unit. Priority:
+-- ClassicAPI's self-contained UnitDistanceSquared/UnitInLineOfSight first,
+-- then UnitXP_SP3, then a plain map-percent distance as last resort.
+-- fallbackX/fallbackY should be the POI's last known map-percent position.
+local function getUnitDistanceAndLOS(unit, fallbackX, fallbackY)
+	local dist, hidden
+
+	if HAS_UNITDISTSQ then
+		local distSq, checked = UnitDistanceSquared(unit)
+		if checked then
+			dist = sqrt(distSq)
+		end
+	end
+	if not dist and HAS_UNITXP3 then
+		local ok, d = pcall(UnitXP, 'distanceBetween', 'player', unit)
+		if ok and d then dist = d end
+	end
+	if not dist then
+		dist = getDistanceTo(fallbackX, fallbackY)
+	end
+
+	if HAS_LOS then
+		local ok, visible = pcall(UnitInLineOfSight, unit)
+		hidden = ok and (visible == false)
+	elseif HAS_UNITXP3 then
+		local ok, inSight = pcall(UnitXP, 'inSight', 'camera', unit)
+		hidden = ok and not inSight
+	else
+		hidden = false
+	end
+
+	return dist, hidden
 end
 
 ---------------------------------------------
@@ -313,22 +415,11 @@ local function updatePOIDistances()
 		if poi then
 			if poi.unit and UnitExists(poi.unit) then
 				-- keep the marker's screen x/y current
-				local ux, uy = GetPlayerMapPosition(poi.unit)
-				if ux and uy and (ux ~= 0 or uy ~= 0) then
-					poi.x = round(ux*100, 3)
-					poi.y = round(uy*100, 3)
+				local ux, uy = getUnitMapPosition(poi.unit)
+				if ux then
+					poi.x, poi.y = ux, uy
 				end
-
-				if HAS_UNITXP3 then
-					local ok, dist = pcall(UnitXP, 'distanceBetween', 'player', poi.unit)
-					poi.dist = ok and dist or getDistanceTo(poi.x, poi.y)
-
-					local sightOk, inSight = pcall(UnitXP, 'inSight', 'camera', poi.unit)
-					poi.hiddenLOS = sightOk and not inSight or false
-				else
-					poi.dist = getDistanceTo(poi.x, poi.y)
-					poi.hiddenLOS = false
-				end
+				poi.dist, poi.hiddenLOS = getUnitDistanceAndLOS(poi.unit, poi.x, poi.y)
 			elseif poi.unit then
 				-- tracked unit is gone (dead, out of range, guid stale) - drop it
 				POITable[i] = nil
@@ -361,10 +452,12 @@ local function addPOI(index, x, y, texture, width, height, sticky, expire)
 	end
 end
 
--- New: track a live unit instead of a fixed point.
--- Requires UnitXP_SP3 for accurate distance/LoS (falls back to map-percent
--- distance without it); uses SuperWoW's GUID (if present) so the POI can't
--- be silently hijacked if the unit id gets reused for a different mob.
+-- New: track a live unit instead of a fixed point. Position comes from
+-- getUnitMapPosition (ClassicAPI's C_Map when available, so this works for
+-- "target", "mouseover", nameplates, party/raid - not just "player");
+-- distance/LoS from getUnitDistanceAndLOS. Uses SuperWoW's GUID (if
+-- present) so the POI can't be silently hijacked if the unit id gets
+-- reused for a different mob.
 local function addPOIForUnit(unit, texture, width, height, sticky, expire)
 	if not UnitExists(unit) then return false end
 
@@ -378,9 +471,9 @@ local function addPOIForUnit(unit, texture, width, height, sticky, expire)
 	if not POITable[index] then
 		POITable[index] = {};
 	end
-	local ux, uy = GetPlayerMapPosition(unit)
-	POITable[index].x = round((ux or 0)*100, 3)
-	POITable[index].y = round((uy or 0)*100, 3)
+	local ux, uy = getUnitMapPosition(unit)
+	POITable[index].x = ux or 0
+	POITable[index].y = uy or 0
 	POITable[index].unit = unit
 	POITable[index].dist = getDistanceTo(POITable[index].x, POITable[index].y)
 
@@ -397,10 +490,21 @@ local function addPOIForUnit(unit, texture, width, height, sticky, expire)
 	return true
 end
 
+-- Distance/LoS checks (UnitDistanceSquared, UnitInLineOfSight, or the
+-- UnitXP_SP3 equivalents) are comparatively expensive - with C_Timer
+-- available we refresh them 5x/sec on a ticker instead of every single
+-- OnUpdate frame. Facing and cardinal-letter sliding still happen every
+-- frame either way, so turning stays perfectly smooth.
+if HAS_CTIMER then
+	C_Timer.NewTicker(0.2, updatePOIDistances)
+end
+
 Addon:SetScript('OnUpdate', function()
 	playerAngle = getPlayerFacing()
 	playerX, playerY = getPlayerPosition()
-	updatePOIDistances()
+	if not HAS_CTIMER then
+		updatePOIDistances()
+	end
 	setCardinalDirections()
 	setPOIIcons(arg1)
 end)
@@ -436,10 +540,15 @@ SlashCmdList['MAPOFSCARSSTATUS'] = function()
 	end
 	DEFAULT_CHAT_FRAME:AddMessage('|cffffd200MapOfScars|r mod status:')
 	line('ClassicAPI', HAS_CLASSICAPI, HAS_CLASSICAPI and 'using native GetPlayerFacing()' or 'using hidden-model facing hack')
-	line('UnitXP_SP3', HAS_UNITXP3, HAS_UNITXP3 and 'unit POIs use distanceBetween/inSight' or 'unit POIs fall back to map-percent distance')
+	line('  - C_Map', HAS_CMAP, HAS_CMAP and 'unit POIs track any unit token (target/mouseover/etc)' or 'unit POIs limited to whatever GetPlayerMapPosition accepts')
+	line('  - UnitDistanceSquared', HAS_UNITDISTSQ, HAS_UNITDISTSQ and 'unit POI distance is real yards' or 'unit POI distance falls back to UnitXP_SP3 or map-percent')
+	line('  - UnitInLineOfSight', HAS_LOS, HAS_LOS and 'unit POIs hide when actually occluded' or 'LoS hiding falls back to UnitXP_SP3 or is disabled')
+	line('  - C_Timer', HAS_CTIMER, HAS_CTIMER and 'POI distance/LoS refreshed 5x/sec via ticker' or 'POI distance/LoS refreshed every frame')
+	line('UnitXP_SP3', HAS_UNITXP3, (HAS_UNITDISTSQ and HAS_LOS) and 'installed, but ClassicAPI covers distance/LoS already' or 'used as distance/LoS fallback')
 	line('SuperWoW', HAS_SUPERWOW, HAS_SUPERWOW and 'unit POIs keyed by GUID' or 'unit POIs keyed by unit id')
 	line('nampower', HAS_NAMPOWER, 'not used by this addon (spell queueing)')
 	line('VanillaHelpers', HAS_VANILLAHELPERS, 'not used by this addon (textures/models)')
+	line('WeirdUtils', HAS_WEIRDUTILS, 'not used by this addon (its only position feature is raid-lead gated)')
 end
 
 -- expose the unit-tracking helper for other addons/macros:
